@@ -3,9 +3,10 @@ package kaggle
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.Encoder
 import org.apache.spark.sql.Dataset
-import org.apache.spark.sql.Row
+import org.apache.spark.sql._
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.functions._
 import org.apache.spark.rdd._
 
 import java.util.regex.Matcher
@@ -85,115 +86,92 @@ object Bosch {
 
 
     //options
-    val samplingRate = 1.0000 //only process a fraction of the dataset
- 
-    //load preprocess dataset or create it
-    val dsTrain = try {  
-       spark.read.parquet("temporaryData/joinedTrain")
-    }catch{
-       case _ : Throwable => {
-          val dsTrainNum = getDataset(spark, "file:///home/loicus/Data/Code/Kaggle/Bosch/inputData/train_numeric.csv"    , DoubleType)
-          val dsTrainCat = getDataset(spark, "file:///home/loicus/Data/Code/Kaggle/Bosch/inputData/train_categorical.csv", StringType)
-          val dsTrainDat = getDataset(spark, "file:///home/loicus/Data/Code/Kaggle/Bosch/inputData/train_date.csv"       , DoubleType)
+    //val samplingFunc:Long=>Boolean = (Id => Id%1000<10) //only process one percent of the dataset
+    val samplingFunc:Long=>Boolean = (Id => true) //all rows
 
-          //join the three datasets in one
-          val dsTrain = sortColumns(
-                           dsTrainNum.join(dsTrainCat, dsTrainCat("Id") === dsTrainNum("Id")).drop(dsTrainCat("Id"))
-                                     .join(dsTrainDat, dsTrainDat("Id") === dsTrainNum("Id")).drop(dsTrainDat("Id"))
-                        )
-         
-          dsTrain.write.mode("overwrite").parquet("temporaryData/joinedTrain")
-          dsTrain
-       }
-    }
+    val (header, rdd) = getUnifiedDataset(spark, "file:///home/loicus/Data/Code/Kaggle/Bosch/inputData/"    , samplingFunc )
 
-    //print the schema of the joined dataset
-    dsTrain.printSchema()
+    //print the schema of the rdd
+    //println(header.mkString("|"))
 
     //print the 20 first entries
-    dsTrain.show()
- 
-    dsTrain.take(25).foreach(println)
+    //rdd.take(20).foreach(a => println("%d --> %s".format(a._1, a._2.mkString("|"))))
 
     //print number of entries that we consider
-    println("Number of entries considered is %d after %f sampling".format(dsTrain.count(), samplingRate))
+    //println("Number of entries considered is %d".format(rdd.count()))
+
+//function bellow must be changed from dataset to rdd
+    
+    //compute per column statistics : Count, Mean, Variance, Min, Max
+    //dsTrain.describe("Id", "Response").show()
+    //dsTest.describe("Id", "Response").show()
+
+    //check if we can build a single table  (no conflicting Id)
+    //val mergedId =  ds.groupBy("Id").agg(countDistinct($"Response").name("distCnt"))
+    //println("Number of entries considered after merged %d".format(mergedId.count()))
+
+    //get all distinct signature by groupping all non null data together
+    //ds.schema.filter(_.dataType != "Id" || _.dataType != "Response").map(_.name)
+    //ds.show()
+
+    val (headerLines, rddLines) = groupByStationBinary(header, rdd)
+    println("Number of different patterns = %d".format(rddLines.count()))
+    println("Lines = (%s)".format(headerLines.mkString(",")))
+    rddLines.foreach(r => println("Pattern (%s) has %d entries".format(r._1.mkString(","), r._2)) )
 
     spark.stop()
   }
 
-  def getDataset(spark:SparkSession, file:String, dataType:DataType):Dataset[Row] = {
+  def getUnifiedDataset(spark:SparkSession, inputDir:String, samplingFunc:Long => Boolean):Tuple2[Seq[String], RDD[Array[Any]] ] = {
+    //load preprocess TRAIN dataset or create it
+    val (dsTrainCatH, dsTrainCat) = getDataset(spark, inputDir+"train_categorical.csv", samplingFunc, ( _.toString) )
+    val (dsTrainDatH, dsTrainDat) = getDataset(spark, inputDir+"train_date.csv"       , samplingFunc, ( _.toDouble) )
+    val (dsTrainNumH, dsTrainNum) = getDataset(spark, inputDir+"train_numeric.csv"    , samplingFunc, ( _.toDouble) )
+
+    val dsTrainH = dsTrainCatH ++ dsTrainDatH.slice(1, dsTrainDatH.length) ++ dsTrainNumH.slice(1, dsTrainNumH.length)
+    val dsTrain = dsTrainCat.join(dsTrainDat).mapValues{case(left,right)=>left++right}.join(dsTrainNum).mapValues{case(left,right)=>left++right}
+
+    //load preprocess TEST dataset or create it
+    val (_, dsTestCat) = getDataset(spark, inputDir+"test_categorical.csv", samplingFunc, ( _.toString) )
+    val (_, dsTestDat) = getDataset(spark, inputDir+"test_date.csv"       , samplingFunc, ( _.toDouble) )
+    var (_, dsTestNum) = getDataset(spark, inputDir+"test_numeric.csv"    , samplingFunc, ( _.toDouble) )
+    dsTestNum = dsTestNum.mapValues(r => r++Array(-1)) //Add negative response to the test sample
+
+    val dsTest = dsTestCat.join(dsTestDat).mapValues{case(left,right)=>left++right}.join(dsTestNum).mapValues{case(left,right)=>left++right}
+
+//    (dsTrainH, (dsTrain++dsTest).map(Array(_._1) ++ _._2))
+    (dsTrainH, dsTrain.map(r => Array[Any](r._1) ++ r._2))
+  }
+
+
+  def getDataset(spark:SparkSession, file:String, samplingFunc:Long => Boolean, cast:String => Any):Tuple2[ Seq[String], RDD[Tuple2[Long,Array[Any]]] ] = {
       //read the header line and use it to infer the schema
-      val schema = spark.sparkContext.textFile(file).map(_.split(",")).first()
-                    .map( name => { if(name=="Id"){StructField(name,LongType, nullable = false)}else{StructField(name, dataType, nullable = true)}  })
+      val header = spark.sparkContext.textFile(file).map(_.split(",", -1)).first()
 
       //return the dataset
-      spark.sqlContext.read
-                .schema(StructType(schema))
-//                .option("nullValue", "-1")
-                .option("inferSchema", "false") // do not automatically infer data types (very slow)
-                .option("header", "true")
-                .csv(file) 
-
+      val rdd = spark.sparkContext.textFile(file).filter(!_.startsWith("Id")).map(_.split(",", -1) )
+                     .filter(r => samplingFunc(r.head.toLong))
+                     .map( r => (r.head.toLong, r.slice(1,r.length).map( s => if(s==""){null}else{cast(s)} ) ) )
+      (header, rdd )
   }
 
-  def sortColumns(ds:Dataset[Row]):Dataset[Row] = {
-    val format = Pattern.compile("L(\\d+)_S(\\d+)_(.)(\\d+)");
+  def groupByStationBinary(header:Seq[String], rdd:RDD[Array[Any]]):Tuple2[Seq[String], RDD[Tuple2[Seq[Int], Int]]] = {
+    val format = Pattern.compile("L(\\d+)_S(\\d+)(_.*)");
+    val groupColumns = header.zipWithIndex.map{ case (c, index) => 
+       val m = format.matcher(c)
+       if(m.find()){  ("L"+m.group(1)+"_S"+m.group(2) ,  Seq(index) ) }
+       else        {  ("", Seq(index)) }
+    }.groupBy(_._1).map{ case(key,values) => (key, values.map(a => a._2).reduce( (a,b) => a ++ b ) ) }.toSeq
 
-    val orderedColumns = ds.columns.sortWith( (a,b) => {
-       val ma =   format.matcher(a)
-       val mb =   format.matcher(b)
-       if(ma.find()){
-          if(mb.find()){
-             if(ma.group(4)==mb.group(4)) ma.group(3)<mb.group(3)
-             else ma.group(4).toInt<mb.group(4).toInt
-          }else{
-             false
-          }
-       }else{
-          if(mb.find()){
-             true
-          }else{
-             a<b
-          }
-       }
-    })
-    ds.select(orderedColumns.map(ds.col(_)):_*)
+    val binaryRdd = rdd.map{ row =>
+       val key    = groupColumns.filter(_._1!="").map{ g => g._2.map(row(_)!=null).reduce( (a,b) => a||b) }.map(if(_){1}else{0})  //line_station info used as grouping key 
+       val value = 1 //just count for now on
+       (key, value)       
+    }.reduceByKey{ (a,b) => a+b }
+     .sortBy(_._2,false) //sort by decreasing count rate
+
+    ( groupColumns.map(_._1) ,   binaryRdd)
   }
-
-
-
-/*
-  //USED TO CREATE A DATASET DIRECTLY FROM A RDD[Row], but it seems to bug because the rows have too many column
-  private def getRowRDD(spark:SparkSession, file:String, dataType:DataType):(RDD[Array[String]], Array[StructField]) = {
-      //read the header line and use it to infer the schema
-      val schemaRDD = spark.sparkContext.textFile(file).map(_.split(",",-1)).first()
-                    .map( name => { if(name=="Id"){StructField(name,StringType, false)}else{StructField(name, dataType, true)}  })
-
-      val rawRDD = spark.sparkContext.textFile(file).filter(!_.startsWith("Id")).map(_.split(",",-1))
-      (rawRDD, schemaRDD)
-  }
-
-  private def getUnifiedDataset(spark:SparkSession, file:String, sampling:Double):Dataset[Row] = {
-     val (inputRDD1, schema1) = getRowRDD(spark, file+"_numeric.csv"    , StringType)
-     val (inputRDD2, schema2) = getRowRDD(spark, file+"_categorical.csv", StringType)
-     val (inputRDD3, schema3) = getRowRDD(spark, file+"_date.csv"       , StringType)
-
-     val schemaUni = schema1 ++ schema2.slice(1,schema2.length) ++ schema3.slice(1,schema3.length)
-
-     val pairRDD1 = inputRDD1.map( a => (a.head, a                   ) )
-     val pairRDD2 = inputRDD2.map( a => (a.head, a.slice(1,a.length) ) ) //drop the Id
-     val pairRDD3 = inputRDD3.map( a => (a.head, a.slice(1,a.length) ) ) //drop the Id
-     
-     val inputRDDUni = pairRDD1.join(pairRDD2).join(pairRDD3).mapValues{ case(v1,v2) => ( v1._1++v1._2++v2) }.values //merged using key but return only values
-     val rowRDDUni = inputRDDUni.sample(true, sampling).map(Row.fromSeq(_))//.cache()
-
-     println(rowRDDUni.first.mkString(";"))
-
-     spark.createDataFrame(rowRDDUni, StructType(schemaUni))      
-
-  }
-*/
-
 
 }
 
