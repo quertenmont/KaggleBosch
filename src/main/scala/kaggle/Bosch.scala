@@ -83,7 +83,7 @@ object Bosch {
 
 
     //options
-    //val samplingFunc:Long=>Boolean = (Id => Id%1000<1) //only process one percent of the dataset
+    //val samplingFunc:Long=>Boolean = (Id => Id%1000<10) //only process one percent of the dataset
     val samplingFunc:Long=>Boolean = (Id => true) //all rows
 
     val (header, rdd) = getUnifiedDataset(spark, "file:///home/loicus/Data/Code/Kaggle/Bosch/inputData/"    , samplingFunc )
@@ -106,44 +106,55 @@ object Bosch {
     //println("Number of overlapping Id = %d".format(rdd.map(row => (row(0),1)).reduceByKey( _+_ ).filter(_._2 > 1).count))
 
     //compute per column statistics : Count, Mean, Variance, Min, Max
-    printStat(spark, header, rdd)
+    val stat = getStat(spark, header, rdd)    
+    stat.foreach{ p=>
+        val statTr0 = p._2.getOrElse( 0 ,new StatCounter())  //Stat for test with response 0
+        val statTr1 = p._2.getOrElse( 1 ,new StatCounter())  //Stat for test with response 0
+        val statTr  = statTr0.copy().merge(statTr1) 
+        val statTe  = p._2.getOrElse(-1 ,new StatCounter())  //Stat for test with response 0
+        val statTo  = statTr.copy().merge(statTe) 
+
+        var buffer:String = "| %20s ".format(p._1.name)
+        buffer += "| %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(statTr0.count, statTr0.mean, statTr0.sampleStdev, statTr0.min, statTr0.max)
+        buffer += "| %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(statTr1.count, statTr1.mean, statTr1.sampleStdev, statTr1.min, statTr1.max)
+        buffer += "| %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(statTr .count, statTr .mean, statTr .sampleStdev, statTr .min, statTr .max)
+        buffer += "| %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(statTe .count, statTe .mean, statTe .sampleStdev, statTe .min, statTe .max)
+        buffer += "| %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(statTo .count, statTo .mean, statTo .sampleStdev, statTo .min, statTo .max)
+        println(buffer + "|")
+    }
 
     //get all distinct signature by groupping all non null data together
-    val (headerLines, rddLines) = groupByStationBinary(header, rdd)
-    println("Number of different patterns = %d".format(rddLines.count()))
+    val (headerLines, patterns) = groupByStationBinary(spark, header, rdd)
+    println("Number of different patterns = %d".format(patterns.size))
     println("Lines = (%s)".format(headerLines.mkString(",")))
-    rddLines.foreach(r => println("Pattern (%s) has %s entries".format(r._1, r._2.mkString(";"))) )
+    patterns.foreach(r => println("Pattern (%s) has %s entries".format(r._1, r._2.mkString(";"))) )
+
+    //get all distinct signature by groupping all non null data together
+    val timeDiff = getTimeSpreadAtStation(spark, header, rdd)
+    timeDiff.foreach(r => println("Timediff at station %15s with %3d time feature : %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(r._1._1, r._1._2, r._2.count, r._2.mean, r._2.sampleStdev, r._2.min, r._2.max)))
 
     //check all different types of category that we can get for each categorical feature
     //WARNING this is quite time consumming
-    var categories = listPossibleCategories(header, rdd)
+    var categories = getPossibleCategories(spark, header, rdd)
     println("category size = %d".format(categories.length))
-    categories.foreach(r => println("%s --> %s".format(r._1.name, r._2.mkString(";") )) )
+    categories.sortWith( (a,b) => a._2.size < b._2.size ).foreach(r => println("%s --> %d CATEGORIES: %s".format(r._1.name, r._2.size, r._2.mkString(";") )) )
 
 
+    //Identify variables than can be removed because they don't bring information
+    header.filter{ h =>
+       if(h.metadata.contains("type") && h.metadata.getString("type")=="D"){  //time variable
+          timeDiff.filter(t => t._1._1==h.metadata.getString("station") && t._2.mean==0 && t._2.sampleStdev==0).size>0
+       }else if(h.metadata.contains("type") && h.metadata.getString("type")=="C"){
+          categories.filter(c => c._1.name==h.name && c._2.size<=2).size>0
+       }else{
+          false
+       }
+    }.foreach(h => println("Variable %s is useless".format(h.name)))
+
+    println("All Done")
     spark.stop()
   }
 
-  def getUnifiedDataset(spark:SparkSession, inputDir:String, samplingFunc:Long => Boolean):Tuple2[Seq[StructField], RDD[Array[Any]] ] = {
-    //load preprocess TRAIN dataset or create it
-    val (dsTrainCatH, dsTrainCat) = getDataset(spark, inputDir+"train_categorical.csv", samplingFunc, StringType, new MetadataBuilder().putString("type", "C").build )
-    val (dsTrainDatH, dsTrainDat) = getDataset(spark, inputDir+"train_date.csv"       , samplingFunc, DoubleType, new MetadataBuilder().putString("type", "D").build )
-    val (dsTrainNumH, dsTrainNum) = getDataset(spark, inputDir+"train_numeric.csv"    , samplingFunc, DoubleType, new MetadataBuilder().putString("type", "N").build )
-
-    val dsTrainH = dsTrainCatH ++ dsTrainDatH.slice(1, dsTrainDatH.length) ++ dsTrainNumH.slice(1, dsTrainNumH.length)
-    val dsTrain  = dsTrainCat.join(dsTrainDat).mapValues{case(left,right)=>left++right}.join(dsTrainNum).mapValues{case(left,right)=>left++right}
-
-    //load preprocess TEST dataset or create it
-    val (_, dsTestCat) = getDataset(spark, inputDir+"test_categorical.csv", samplingFunc, StringType, new MetadataBuilder().putString("type", "C").build  )
-    val (_, dsTestDat) = getDataset(spark, inputDir+"test_date.csv"       , samplingFunc, DoubleType, new MetadataBuilder().putString("type", "D").build )
-    var (_, dsTestNum) = getDataset(spark, inputDir+"test_numeric.csv"    , samplingFunc, DoubleType, new MetadataBuilder().putString("type", "N").build )
-    dsTestNum = dsTestNum.mapValues(r => r++Array(-1)) //Add negative response to the test sample
-
-    val dsTest = dsTestCat.join(dsTestDat).mapValues{case(left,right)=>left++right}.join(dsTestNum).mapValues{case(left,right)=>left++right}
-
-//    (fillMetadataAndSort(dsTrainH), (dsTrain++dsTest).map(Array(_._1) ++ _._2))
-    (fillMetadataAndSort(dsTrainH), dsTrain.map(r => Array[Any](r._1) ++ r._2))
-  }
 
   def getDataset(spark:SparkSession, file:String, samplingFunc:Long => Boolean, dataType:DataType, metadata:Metadata):Tuple2[ Seq[StructField], RDD[Tuple2[Long,Array[Any]]] ] = {
       val cast:String=>Any = { dataType match {
@@ -161,6 +172,30 @@ object Bosch {
                      .map( r => (r.head.toLong, r.slice(1,r.length).map( s => if(s==""){null}else{cast(s)} ) ) )
       (header, rdd )
   }
+
+  def getUnifiedDataset(spark:SparkSession, inputDir:String, samplingFunc:Long => Boolean):Tuple2[Seq[StructField], RDD[Array[Any]] ] = {
+    //load preprocess TRAIN dataset or create it
+    val (dsTrainCatH, dsTrainCat) = getDataset(spark, inputDir+"train_categorical.csv", samplingFunc, StringType, new MetadataBuilder().putString("type", "C").build )
+    val (dsTrainDatH, dsTrainDat) = getDataset(spark, inputDir+"train_date.csv"       , samplingFunc, DoubleType, new MetadataBuilder().putString("type", "D").build )
+    val (dsTrainNumH, dsTrainNum) = getDataset(spark, inputDir+"train_numeric.csv"    , samplingFunc, DoubleType, new MetadataBuilder().putString("type", "N").build )
+
+    val dsTrainH = dsTrainCatH ++ dsTrainDatH.slice(1, dsTrainDatH.length) ++ dsTrainNumH.slice(1, dsTrainNumH.length)
+    val dsTrain  = dsTrainCat.join(dsTrainDat).mapValues{case(left,right)=>left++right}.join(dsTrainNum).mapValues{case(left,right)=>left++right}
+
+    //load preprocess TEST dataset or create it
+    val (_, dsTestCat) = getDataset(spark, inputDir+"test_categorical.csv", samplingFunc, StringType, new MetadataBuilder().putString("type", "C").build  )
+    val (_, dsTestDat) = getDataset(spark, inputDir+"test_date.csv"       , samplingFunc, DoubleType, new MetadataBuilder().putString("type", "D").build )
+    var (_, dsTestNum) = getDataset(spark, inputDir+"test_numeric.csv"    , samplingFunc, DoubleType, new MetadataBuilder().putString("type", "N").build )
+    dsTestNum = dsTestNum.mapValues(r => r++Array((-1).toDouble)) //Add negative response to the test sample
+
+    val dsTest = dsTestCat.join(dsTestDat).mapValues{case(left,right)=>left++right}.join(dsTestNum).mapValues{case(left,right)=>left++right}
+
+    (fillMetadataAndSort(dsTrainH), (dsTrain++dsTest).map(r => Array[Any](r._1) ++ r._2))
+//    (fillMetadataAndSort(dsTrainH), dsTrain.map(r => Array[Any](r._1) ++ r._2))
+//    (fillMetadataAndSort(dsTrainH), dsTest.map(r => Array[Any](r._1) ++ r._2))
+  }
+
+
 
   def mergeMap[A](a:Map[A,Int], b:Map[A,Int]):Map[A,Int] = {
      a++b.map{ case (k,v) => k -> (v + a.getOrElse(k,0)) }
@@ -189,72 +224,112 @@ object Bosch {
      groupColumns.map{ g => g._2.map(s => cellValue(row, s)!=null).reduce( (a,b) => a||b) }.map(if(_){"1"}else{"0"}).mkString("")
   }
 
-  def groupByStationBinary(header:Seq[StructField], rdd:RDD[Array[Any]]):Tuple2[Seq[String], RDD[Tuple2[String, Map[String,Int]]]] = {
+  def groupByStationBinary(spark:SparkSession, header:Seq[StructField], rdd:RDD[Array[Any]]):Tuple2[Seq[String], Array[Tuple2[String, Map[String,Int]]]] = {
     val groupColumns = header.filter(_.metadata.getString("station")!="").groupBy(_.metadata.getString("station")).toSeq.sortWith{ (a,b) => a._1 < b ._1 }
-    val ResponseColumn = header.filter(_.name=="Response").head
 
-    val binaryRdd = rdd.map{ row =>
-//       val key    = groupColumns.map{ g => g._2.map(s => cellValue(row, s)!=null).reduce( (a,b) => a||b) }.map(if(_){1.toInt}else{0.toInt})  //line_station info used as grouping key 
-       val key = getPattern(groupColumns, row)
-       val value = Map( cellValue(row, ResponseColumn).toString -> 1, "Any" -> 1) //just count 1 per response type and for total
-       (key, value)       
-    }.reduceByKey{ (a,b) => mergeMap(a,b) }
-    .mapValues(m => Map(m.toSeq.sortWith(_._1 < _._1):_*) ) //order items in map 
-    .sortBy(_._2("Any"),false) //order patterns by importance
+    try { 
+       val toReturn:Array[Tuple2[String, Map[String,Int]]] = spark.sparkContext.objectFile("preprocessedData/patterns").collect()
+       ( groupColumns.map(_._1) ,   toReturn)
+    }catch{
+       case _ : Throwable => {
+       println("processing station patterns")
 
-    ( groupColumns.map(_._1) ,   binaryRdd)
-  }
+       val ResponseColumn = header.filter(_.name=="Response").head
 
-  def listPossibleCategories(header:Seq[StructField], rdd:RDD[Array[Any]]):Seq[Tuple2[StructField, Map[String,Int]]] = {
-    val catColumns = header.filter(c => c.dataType==StringType && c.metadata.getString("station")!="" && c.metadata.getString("type")=="C")
+       val binaryRdd = rdd.map{ row =>
+          val key = getPattern(groupColumns, row)
+          val value = Map( cellValue(row, ResponseColumn).toString -> 1, "Any" -> 1) //just count 1 per response type and for total
+          (key, value)       
+       }.reduceByKey{ (a,b) => mergeMap(a,b) }
+       .mapValues(m => Map(m.toSeq.sortWith(_._1 < _._1):_*) ) //order items in map 
+       .sortBy(_._2("Any"),false) //order patterns by importance
 
-    val catFreq = rdd.map{ row =>  
-       catColumns.map{ col =>
-          val v = cellValue(row, col)
-          if( v==null){Map[String,Int]()}else{ Map( v.toString -> 1, "Any" -> 1) }      
-    }}.reduce{ (ma,mb) => ma.zip(mb).map{case (a,b) => mergeMap(a,b) } } 
-    .map(m => Map(m.toSeq.sortWith(_._1 < _._1):_*) ) //order items in map 
-
-    catColumns.zip(catFreq)
-  }
-
-  def printStat(spark:SparkSession, header:Seq[StructField], rdd:RDD[Array[Any]]):Unit = {
-     val responseIndex = header.filter(_.name=="Response").head.metadata.getLong("colIndex").toInt
-     val doubleCol = header.filter(_.dataType==DoubleType)
-
-
-     val StatAll = rdd
-         .map{row => doubleCol.map{c => 
-            val v = cellValue(row, c) 
-            val r = row(responseIndex)
-            val s = new StatCounter()
-            if(v !=null ) s.merge(v.asInstanceOf[Double])
-            Map( r -> s )  //return a map to save the results per response type 
-         }}
-         .reduce( (a,b) => a.zip(b).map( p =>  p._1++p._2.map{ case (k,v) => k -> (v.merge(p._1.getOrElse(k,new StatCounter())) ) } ) )
-
-     
-     StatAll.zip(doubleCol).foreach{ p=>
-        var buffer:String = "| %20s ".format(p._2.name)
-
-        var statTe0 = p._1.getOrElse( 0 ,new StatCounter())  //Stat for test with response 0
-        var statTe1 = p._1.getOrElse( 1 ,new StatCounter())  //Stat for test with response 0
-        var statTe  = statTe0.merge(statTe1) 
-        var statTr  = p._1.getOrElse(-1 ,new StatCounter())  //Stat for test with response 0
-        var statTo  = statTe.merge(statTr) 
-
-        buffer += "| %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(statTe0.count, statTe0.mean, statTe0.sampleStdev, statTe0.min, statTe0.max)
-        buffer += "| %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(statTe1.count, statTe1.mean, statTe1.sampleStdev, statTe1.min, statTe1.max)
-        buffer += "| %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(statTe .count, statTe .mean, statTe .sampleStdev, statTe .min, statTe .max)
-        buffer += "| %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(statTr .count, statTr .mean, statTr .sampleStdev, statTr .min, statTr .max)
-        buffer += "| %+8d - %+8.2f - %+8.2f - %8.2f - %8.2f ".format(statTo .count, statTo .mean, statTo .sampleStdev, statTo .min, statTo .max)
-        println(buffer + "|")
-     }
-
+       val toReturn = binaryRdd 
+       toReturn.saveAsObjectFile("preprocessedData/patterns")
+       ( groupColumns.map(_._1) ,   toReturn.collect())
+     }}
   }
 
 
+  def getTimeSpreadAtStation(spark:SparkSession, header:Seq[StructField], rdd:RDD[Array[Any]]):Seq[((String,Int),StatCounter)] = {
+    try {  
+       val toReturn: Array[((String,Int),StatCounter)] = spark.sparkContext.objectFile("preprocessedData/timeSpread").collect()
+       toReturn
+    }catch{
+       case _ : Throwable => {
+       println("processing time distribution")
 
+       val groupColumns   = header.filter(c => c.metadata.getString("station")!="" && c.metadata.getString("type")=="D").groupBy(_.metadata.getString("station")).toSeq.sortWith{ (a,b) => a._1 < b ._1 }
+       val ResponseColumn = header.filter(_.name=="Response").head
+
+       val timeDiffRdd = rdd.map{ row =>
+          val diffTimeAtStation = groupColumns.map{ g =>
+             val timeList = g._2.map(s => cellValue(row, s)).filter(c => c!=null && c.isInstanceOf[Double]).map(_.asInstanceOf[Double]) 
+             if(timeList.size==0) new StatCounter()  
+             else                 new StatCounter().merge(timeList.max - timeList.min) 
+          }
+          diffTimeAtStation
+       }.reduce{ (a,b) => a.zip(b).map(p => p._1.merge(p._2)) }
+       val toReturn = groupColumns.map( h => (h._1, h._2.size ) ).zip(timeDiffRdd)
+       spark.sparkContext.parallelize(toReturn).saveAsObjectFile("preprocessedData/timeSpread")
+       toReturn
+    }}
+  }
+
+
+  //get all possible values for each categorical variables
+  def getPossibleCategories(spark:SparkSession, header:Seq[StructField], rdd:RDD[Array[Any]]):Seq[(StructField, Map[String,Int])] = {
+    try {  
+       val toReturn: Array[(StructField, Map[String,Int])] = spark.sparkContext.objectFile("preprocessedData/categories").collect()
+       toReturn
+    }catch{
+       case _ : Throwable => {
+       println("processing categories")
+
+       val catColumns = header.filter(c => c.dataType==StringType && c.metadata.getString("station")!="" && c.metadata.getString("type")=="C")
+
+       val catFreq = rdd.map{ row =>  
+          catColumns.map{ col =>
+             val v = cellValue(row, col)
+             if( v==null){Map[String,Int]()}else{ Map( v.toString -> 1, "Any" -> 1) }      
+       }}.reduce{ (ma,mb) => ma.zip(mb).map{case (a,b) => mergeMap(a,b) } } 
+       .map(m => Map(m.toSeq.sortWith(_._1 < _._1):_*) ) //order items in map 
+
+       val toReturn = catColumns.zip(catFreq)
+       spark.sparkContext.parallelize(toReturn).saveAsObjectFile("preprocessedData/categories")
+       toReturn
+     }}
+
+  }
+
+  //get statistics for each numerical variables (and type of response)
+  def getStat(spark:SparkSession, header:Seq[StructField], rdd:RDD[Array[Any]]):Seq[(StructField, Map[Any,StatCounter])] = {
+
+    try {  
+       val toReturn: Array[(StructField, Map[Any, StatCounter])] = spark.sparkContext.objectFile("preprocessedData/stats").collect()
+       toReturn
+    }catch{
+       case _ : Throwable => {
+        println("processing statistics")
+
+        val responseIndex = header.filter(_.name=="Response").head.metadata.getLong("colIndex").toInt
+        val doubleCol = header.filter(_.dataType==DoubleType)
+
+        val StatAll = rdd
+            .map{row => doubleCol.map{c => 
+               val v = cellValue(row, c) 
+               val r = row(responseIndex)
+               val s = new StatCounter()
+               if(v !=null ) s.merge(v.asInstanceOf[Double])
+               Map( r -> s )  //return a map to save the results per response type 
+            }}
+            .reduce( (a,b) => a.zip(b).map( p =>  p._1++p._2.map{ case (k,v) => k -> (v.merge(p._1.getOrElse(k,new StatCounter())) ) } ) )
+
+        val toReturn = doubleCol.zip(StatAll)
+       spark.sparkContext.parallelize(toReturn).saveAsObjectFile("preprocessedData/stats")
+       toReturn
+     }}
+  }
 
 }
 
