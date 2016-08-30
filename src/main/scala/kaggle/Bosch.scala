@@ -244,13 +244,14 @@ object Bosch {
          v match{
          case null   => ""
          case _:Float => "%.4f".format(v)
+         case _:Double => "%.4f".format(v)
          case _ => v.toString
          }
       }.mkString(",")
     }
 
-    normRDD.saveAsTextFile("normalized/test")
-    val out = new PrintWriter("normalized/header.csv");
+    normRDD.saveAsTextFile("normalized2/test")
+    val out = new PrintWriter("normalized2/header.csv");
 //    normRDD.collect.foreach(l => out.println(l))
     out.println(usefulFeaturesEncoded.map(_.name).mkString(","))
     out.close()
