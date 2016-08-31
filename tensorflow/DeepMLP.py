@@ -84,7 +84,7 @@ def deepMLP(input, layers):
     results = input
     for i in range(1,len(layers)):
         results = denseLayer("MLPlayer"+str(i), results, layers[i-1], layers[i])
-    return tf.nn.relu(results)
+    return tf.sigmoid(results) #we want a probability in [0 , 1]
 
 #global variable
 nameToTFVariable = {}
@@ -112,7 +112,7 @@ def getFeedDict(data):
 
 ###############MAIN#####################
 
-batchSize = 2500
+batchSize = 1000
 
 #read the header and the validation sample
 with open('../normalized.csv', 'r') as f:
@@ -136,21 +136,39 @@ with graph.as_default():
 
     with tf.name_scope("cost") as scope:
         #subtle gymnastic to keep everything differentiable
-        TP = 0.1 + tf.reduce_sum( tf.select(tf.logical_and(tf.   greater(Response, 0.5), tf.   greater(out_L0_S05, 0.5)) , tf.maximum(tf.minimum(out_L0_S05,1.0),1.0), tf.maximum(tf.minimum(out_L0_S05,0.0),0.0)  ) )
-        TN = 0.1 + tf.reduce_sum( tf.select(tf.logical_and(tf.less_equal(Response, 0.5), tf.less_equal(out_L0_S05, 0.5)) , tf.maximum(tf.minimum(out_L0_S05,1.0),1.0), tf.maximum(tf.minimum(out_L0_S05,0.0),0.0)  ) )
-        FN = 0.1 + tf.reduce_sum( tf.select(tf.logical_and(tf.   greater(Response, 0.5), tf.less_equal(out_L0_S05, 0.5)) , tf.maximum(tf.minimum(out_L0_S05,1.0),1.0), tf.maximum(tf.minimum(out_L0_S05,0.0),0.0)  ) )
-        FP = 0.1 + tf.reduce_sum( tf.select(tf.logical_and(tf.less_equal(Response, 0.5), tf.   greater(out_L0_S05, 0.5)) , tf.maximum(tf.minimum(out_L0_S05,1.0),1.0), tf.maximum(tf.minimum(out_L0_S05,0.0),0.0)  ) )
-        MCC  = 1 - tf.div ( tf.sub(tf.mul(TP,TN),tf.mul(FP,FN)) ,  tf.sqrt( tf.mul( tf.mul(tf.add(TP,FP),tf.add(TP,FN)) , tf.mul(tf.add(TN,FP),tf.add(TN,FN)) ) ) )
-        cost = MCC 
+#        TP = 0.1 + tf.reduce_sum( tf.select(tf.logical_and(tf.   greater(Response, 0.5), tf.   greater(out_L0_S05, 0.5)) , tf.maximum(tf.minimum(out_L0_S05,1.0),1.0), tf.maximum(tf.minimum(out_L0_S05,0.0),0.0)  ) )
+#        TN = 0.1 + tf.reduce_sum( tf.select(tf.logical_and(tf.less_equal(Response, 0.5), tf.less_equal(out_L0_S05, 0.5)) , tf.maximum(tf.minimum(out_L0_S05,1.0),1.0), tf.maximum(tf.minimum(out_L0_S05,0.0),0.0)  ) )
+#        FN = 0.1 + tf.reduce_sum( tf.select(tf.logical_and(tf.   greater(Response, 0.5), tf.less_equal(out_L0_S05, 0.5)) , tf.maximum(tf.minimum(out_L0_S05,1.0),1.0), tf.maximum(tf.minimum(out_L0_S05,0.0),0.0)  ) )
+#        FP = 0.1 + tf.reduce_sum( tf.select(tf.logical_and(tf.less_equal(Response, 0.5), tf.   greater(out_L0_S05, 0.5)) , tf.maximum(tf.minimum(out_L0_S05,1.0),1.0), tf.maximum(tf.minimum(out_L0_S05,0.0),0.0)  ) )
+#        MCC  = 1 - tf.div ( tf.sub(tf.mul(TP,TN),tf.mul(FP,FN)) ,  tf.sqrt( tf.mul( tf.mul(tf.add(TP,FP),tf.add(TP,FN)) , tf.mul(tf.add(TN,FP),tf.add(TN,FN)) ) ) )
+
+
+        crossentropy = - tf.reduce_sum( tf.add(tf.mul(Response,tf.log(out_L0_S05))  , tf.mul(tf.sub(1.0,Response), tf.log(tf.sub(1.0,out_L0_S05)) ) ) )
+        L2   = tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables()])*0.001
+        cost = crossentropy + L2 #  tf.Print(crossentropy + L2, [crossentropy, L2])  # + L2
+
+        TP = tf.reduce_sum( tf.cast(tf.logical_and(tf.greater_equal(Response, 0.5) , tf.greater_equal(out_L0_S05, 0.5) ), tf.float32) )
+        TN = tf.reduce_sum( tf.cast(tf.logical_and(tf.   less_equal(Response, 0.5) , tf.   less_equal(out_L0_S05, 0.5) ), tf.float32) )
+        FP = tf.reduce_sum( tf.cast(tf.logical_and(tf.greater_equal(Response, 0.5) , tf.   less_equal(out_L0_S05, 0.5) ), tf.float32) )
+        FN = tf.reduce_sum( tf.cast(tf.logical_and(tf.   less_equal(Response, 0.5) , tf.greater_equal(out_L0_S05, 0.5) ), tf.float32) )
+        MCC  = tf.div ( tf.sub(tf.mul(FP,FN),tf.mul(TP,TN)) ,  tf.sqrt( tf.mul( tf.mul(tf.add(TP,FP),tf.add(TP,FN)) , tf.mul(tf.add(TN,FP),tf.add(TN,FN)) ) ) )
 
         tf.scalar_summary('cost', cost)
-        tf.scalar_summary('MCC', MCC)
+        tf.scalar_summary('crossentropy', crossentropy)
+        tf.scalar_summary('L2', L2)
         tf.scalar_summary('TP', TP)
         tf.scalar_summary('TN', TN)
+        tf.scalar_summary('FP', FP)
+        tf.scalar_summary('FN', FN)
+        tf.scalar_summary('MCC', MCC)
+
 
     with tf.name_scope("trainer") as scope:
         optimizer = tf.train.AdamOptimizer(0.01, use_locking=True)
         training = optimizer.minimize(cost)#, gate_gradients=optimizer.GATE_OP)
+
+        grads_and_vars = optimizer.compute_gradients(cost)
+        gradsA = tf.Print(grads_and_vars[0][0], grads_and_vars)
 
 
     TFSummary = tf.merge_all_summaries()        
@@ -182,6 +200,9 @@ with open('../normalized.csv', 'r') as f:
             totalLineRead += batchSize
 
         #train on the batch
+        #grads = sess.run([gradsA], feed_dict=getFeedDict(batch))
+        #print(grads)
+
         outTrain = sess.run([cost, TFSummary, training], feed_dict=getFeedDict(batch))
         if iteration % 1 == 0:
            outValid = sess.run([cost, TFSummary], feed_dict=getFeedDict(validation))
