@@ -60,7 +60,7 @@ def readBatch(f, BatchSize, groupHeader, train=False, test=False, validation=Fal
           if(test       and (not testFlag or     valFlag) ): continue
           if(validation and (    testFlag or not valFlag) ): continue
 
-          if(train and background>int(BatchSize*0.3) and float(row[groupHeader["Response"][0]])==0):continue
+          if(train and background>int(BatchSize*0.2) and float(row[groupHeader["Response"][0]])==0):continue
           if(float(row[groupHeader["Response"][0]])==0):background+=1
        
           #change datatype
@@ -130,7 +130,7 @@ def loss_hinge(out, target):
 
 ###############MAIN#####################
 
-batchSize = 250
+batchSize = 400
 
 GroupList = ['L0_S00','L0_S01','L0_S02','L0_S03','L0_S04','L0_S05','L0_S06','L0_S07','L0_S08','L0_S09','L0_S10','L0_S11','L0_S12','L0_S13','L0_S14','L0_S15','L0_S16','L0_S17','L0_S18','L0_S19','L0_S20','L0_S21','L0_S22','L0_S23','L1_S24','L1_S25','L2_S26','L2_S27','L2_S28','L3_S29','L3_S30','L3_S31','L3_S32','L3_S33','L3_S34','L3_S35','L3_S36','L3_S37','L3_S38','L3_S39','L3_S40','L3_S41','L3_S42','L3_S43','L3_S44','L3_S45','L3_S46','L3_S47','L3_S48','L3_S49','L3_S50','L3_S51']
 
@@ -265,7 +265,13 @@ with open('../normalized.csv', 'r') as f:
 #        print("Gates:"+str(gate))
 #        print("Patterns:"+str(batch["Pattern"]))
 
-        outTrain = sess.run([cost, TFSummary, outFinal, debug] + pretrainingAtStation, feed_dict=getFeedDict(batch))
+        if(epoch<=100):
+           #per station pretraining
+           outTrain = sess.run([cost, TFSummary, outFinal, debug] + pretrainingAtStation, feed_dict=getFeedDict(batch))
+        else:
+           #global training
+           outTrain = sess.run([cost, TFSummary, outFinal, debug, training], feed_dict=getFeedDict(batch))
+
         if iteration % 10 == 0:
            outValid = sess.run([cost, TFSummary], feed_dict=getFeedDict(validation))
            print("Iteration=%5i Epoch=%2i LineRead=%8i --> cost (train) = %6.3f / cost (validation) = %+6.3f" % (iteration,epoch,totalLineRead,outTrain[0], outValid[0]))
@@ -280,7 +286,7 @@ with open('../normalized.csv', 'r') as f:
 
 
 
-        if(epoch>=10):break #stopping after nloop on the files
+        if(epoch>=200):break #stopping after nloop on the files
 t_end = time.clock()
 print('Elapsed time ', t_end - t_start)
 
