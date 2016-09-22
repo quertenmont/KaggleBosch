@@ -122,7 +122,7 @@ def getFeedDict(data):
 
 
 def loss_log(out, target):
-    return - tf.reduce_sum( target * tf.log(out)  + (1.0-target)*tf.log(1.0-out) )
+    return - tf.reduce_sum( target * tf.log(tf.minimum(0.001,out))  + (1.0-target)*tf.log(1.0-tf.minimum(0.001,out)) )
 
 def loss_hinge(out, target):
     return tf.reduce_sum( tf.maximum( 0.0, 1.0 - ((2.0*target)-1.0) * ((2.0*out)-1.0)  ) )    
@@ -165,7 +165,7 @@ with graph.as_default():
            with tf.name_scope("pre-training") as scope:
               with tf.name_scope("loss") as scope:      
                  patternMask = tf.greater(Pattern[:,i],0.5)
-                 stationloss = loss_hinge(tf.boolean_mask(out, patternMask), tf.boolean_mask(Response, patternMask))
+                 stationloss = loss_log(tf.boolean_mask(out, patternMask), tf.boolean_mask(Response, patternMask))
                  stationcost = stationloss
                  
               with tf.name_scope("trainer") as scope:
@@ -203,7 +203,7 @@ with graph.as_default():
         with tf.name_scope("loss") as scope:      
 #           debug = tf.maximum( 0.0, 1.0 - (2.0*(Response-1.0)) * (2.0*(outFinal-1.0))  )
            debug = 1.0 - ((2.0*Response)-1.0) * ((2.0*outFinal)-1.0)
-           crossentropy = loss_hinge(outFinal, Response)
+           crossentropy = loss_log(outFinal, Response)
            cost = crossentropy# + L2
         #cost = tf.Print(crossentropy, [Response, outFinal, TP, TN, FN, FP, MCC,  TPa, TNa, FPa, FNa, MCCa])  # + L2
 
@@ -265,7 +265,7 @@ with open('../normalized.csv', 'r') as f:
 #        print("Gates:"+str(gate))
 #        print("Patterns:"+str(batch["Pattern"]))
 
-        if(epoch<=100):
+        if(epoch<=25):
            #per station pretraining
            outTrain = sess.run([cost, TFSummary, outFinal, debug] + pretrainingAtStation, feed_dict=getFeedDict(batch))
         else:
@@ -286,7 +286,7 @@ with open('../normalized.csv', 'r') as f:
 
 
 
-        if(epoch>=200):break #stopping after nloop on the files
+        if(epoch>=50):break #stopping after nloop on the files
 t_end = time.clock()
 print('Elapsed time ', t_end - t_start)
 
